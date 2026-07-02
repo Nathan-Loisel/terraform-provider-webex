@@ -38,7 +38,64 @@ type APIError struct {
 }
 
 func (e *APIError) Error() string {
-	return fmt.Sprintf("webex API error (HTTP %d, tracking: %s): %s", e.StatusCode, e.TrackingID, e.Message)
+	msg := fmt.Sprintf("webex API error (HTTP %d, tracking: %s): %s", e.StatusCode, e.TrackingID, e.Message)
+	if e.StatusCode == http.StatusUnauthorized {
+		msg += "\n\nThis is likely caused by an expired access token. Token lifetimes:\n" +
+			"  - Developer portal temporary token: 12 hours\n" +
+			"  - Service App access token: 14 days\n" +
+			"  - Service App refresh token: 90 days\n" +
+			"If using a static token, regenerate it from the Webex Developer Portal.\n" +
+			"If using OAuth (client_id + client_secret + refresh_token), your refresh token may have expired — regenerate it from your Service App's Org Authorizations page."
+	}
+	return msg
+}
+
+type tokenResponse struct {
+	AccessToken  string `json:"access_token"`
+	RefreshToken string `json:"refresh_token"`
+	ExpiresIn    int    `json:"expires_in"`
+}
+
+func FetchAccessToken(clientID, clientSecret, refreshToken string) (string, error) {
+	data := url.Values{
+		"grant_type":    {"refresh_token"},
+		"client_id":     {clientID},
+		"client_secret": {clientSecret},
+		"refresh_token": {refreshToken},
+	}
+
+	resp, err := http.PostForm("https://webexapis.com/v1/access_token", data)
+	if err != nil {
+		return "", fmt.Errorf("requesting access token: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("reading token response: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("failed to obtain access token (HTTP %d): %s\n\n"+
+			"This is likely caused by an expired refresh token (refresh tokens expire after 90 days).\n"+
+			"To fix this:\n"+
+			"  1. Go to your Service App page on developer.webex.com\n"+
+			"  2. Under 'Org Authorizations', select your org\n"+
+			"  3. Enter your Client Secret and click 'Generate Tokens'\n"+
+			"  4. Copy the new refresh token and update your configuration",
+			resp.StatusCode, string(body))
+	}
+
+	var tokenResp tokenResponse
+	if err := json.Unmarshal(body, &tokenResp); err != nil {
+		return "", fmt.Errorf("parsing token response: %w", err)
+	}
+
+	if tokenResp.AccessToken == "" {
+		return "", fmt.Errorf("token response did not contain an access token")
+	}
+
+	return tokenResp.AccessToken, nil
 }
 
 func (c *Client) do(ctx context.Context, method, path string, params url.Values, body interface{}, result interface{}) error {
