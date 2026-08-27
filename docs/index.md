@@ -98,6 +98,34 @@ When authentication fails, the provider includes guidance in the error message:
 - **During OAuth exchange** — If the refresh token has expired, the error will explain that the refresh token (90-day lifetime) needs to be regenerated and how to do it.
 - **During API calls** — If the access token is invalid or expired, the error will list all token lifetimes (12h, 14d, 90d) and suggest regeneration steps for both auth methods.
 
+## Rate Limiting
+
+Webex applies its API quota per organisation, so every resource in an apply
+competes for the same budget. A plan that touches several workspaces or device
+configurations will routinely see `HTTP 429 Too Many Requests`.
+
+The provider retries these itself. A request that fails with `429`, `502`,
+`503`, or `504` is retried up to 5 times with exponential backoff and jitter.
+When the response carries a `Retry-After` header the provider waits exactly
+that long, in either the seconds or HTTP-date form; otherwise the delay
+doubles from one second up to a thirty-second ceiling. Backoff is interrupted
+if Terraform is cancelled.
+
+Retries are transparent: no configuration is needed, and a request that
+eventually succeeds is not reported as an error.
+
+If an apply still fails with `429` after the retries, the organisation is
+being throttled harder than the backoff can absorb. Lower Terraform's
+concurrency:
+
+```console
+$ terraform apply -parallelism=2
+```
+
+Only `429`, `502`, `503`, and `504` are retried. Other `4xx` responses are
+returned immediately, since retrying a rejected request will not change the
+outcome.
+
 ## Required Scopes
 
 | Scope | Purpose |
