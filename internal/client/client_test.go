@@ -97,6 +97,122 @@ func TestDoPatchRetriesRateLimit(t *testing.T) {
 	}
 }
 
+// A 502/503/504 leaves the outcome unknown: Webex may have carried the request
+// out and lost the response. Replaying a POST there would create a second
+// device or workspace.
+func TestPostIsNotReplayedWhenOutcomeIsUnknown(t *testing.T) {
+	for _, status := range []int{http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout} {
+		t.Run(fmt.Sprint(status), func(t *testing.T) {
+			var calls int32
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				atomic.AddInt32(&calls, 1)
+				w.WriteHeader(status)
+			}))
+			defer srv.Close()
+
+			err := testClient(srv).do(context.Background(), http.MethodPost, "devices", nil, map[string]string{"a": "b"}, nil)
+			if err == nil {
+				t.Fatal("expected an error")
+			}
+			if got := atomic.LoadInt32(&calls); got != 1 {
+				t.Fatalf("POST was replayed %d times after %d", got-1, status)
+			}
+		})
+	}
+}
+
+// A dropped connection is the same unknown-outcome problem as a 502.
+func TestPostIsNotReplayedOnNetworkError(t *testing.T) {
+	var calls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		// Hijack and close without writing a response so the client sees a
+		// transport error rather than a status code.
+		conn, _, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			t.Errorf("hijack: %v", err)
+			return
+		}
+		_ = conn.Close()
+	}))
+	defer srv.Close()
+
+	if err := testClient(srv).do(context.Background(), http.MethodPost, "devices", nil, map[string]string{"a": "b"}, nil); err == nil {
+		t.Fatal("expected an error")
+	}
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Fatalf("POST was replayed %d times after a network error", got-1)
+	}
+}
+
+// 429 is the exception: the request was refused outright, so nothing can have
+// happened and even a create is safe to send again.
+func TestPostIsRetriedOnRateLimit(t *testing.T) {
+	var calls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if atomic.AddInt32(&calls, 1) < 3 {
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		_, _ = io.WriteString(w, `{"id":"created"}`)
+	}))
+	defer srv.Close()
+
+	var out struct {
+		ID string `json:"id"`
+	}
+	if err := testClient(srv).do(context.Background(), http.MethodPost, "devices", nil, map[string]string{"a": "b"}, &out); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if out.ID != "created" {
+		t.Fatalf("id = %q", out.ID)
+	}
+	if got := atomic.LoadInt32(&calls); got != 3 {
+		t.Fatalf("expected 3 attempts, got %d", got)
+	}
+}
+
+func TestIdempotentMethodsAreReplayedOnServerError(t *testing.T) {
+	for _, method := range []string{http.MethodGet, http.MethodPut, http.MethodDelete} {
+		t.Run(method, func(t *testing.T) {
+			var calls int32
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if atomic.AddInt32(&calls, 1) < 2 {
+					w.WriteHeader(http.StatusBadGateway)
+					return
+				}
+				_, _ = io.WriteString(w, `{}`)
+			}))
+			defer srv.Close()
+
+			if err := testClient(srv).do(context.Background(), method, "devices", nil, nil, nil); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got := atomic.LoadInt32(&calls); got != 2 {
+				t.Fatalf("%s attempted %d times, want 2", method, got)
+			}
+		})
+	}
+}
+
+func TestIsIdempotent(t *testing.T) {
+	for _, m := range []string{
+		http.MethodGet, http.MethodHead, http.MethodPut,
+		http.MethodDelete, http.MethodOptions, http.MethodTrace,
+	} {
+		if !isIdempotent(m) {
+			t.Errorf("%s should be idempotent", m)
+		}
+	}
+	// PATCH is not idempotent in general; doPatch opts in explicitly because
+	// every op this provider sends is a replace or a remove.
+	for _, m := range []string{http.MethodPost, http.MethodPatch} {
+		if isIdempotent(m) {
+			t.Errorf("%s must not be treated as idempotent", m)
+		}
+	}
+}
+
 // Exhausting the retries must still produce the API's own explanation. The
 // previous loop closed the body before the final read, so the caller got
 // "read on closed response body" instead of the 429 and its tracking ID.
@@ -151,6 +267,29 @@ func TestNonRetryableStatusFailsImmediately(t *testing.T) {
 				t.Fatal("IsNotFound stopped recognising 404")
 			}
 		})
+	}
+}
+
+// MaxRetries is a real switch: zero means one attempt, and a negative value is
+// clamped rather than read as "retry forever".
+func TestMaxRetriesZeroDisablesRetrying(t *testing.T) {
+	var calls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer srv.Close()
+
+	c := testClient(srv)
+	for _, n := range []int{0, -1} {
+		atomic.StoreInt32(&calls, 0)
+		c.MaxRetries = n
+		if err := c.do(context.Background(), http.MethodGet, "devices", nil, nil, nil); err == nil {
+			t.Fatalf("MaxRetries=%d: expected an error", n)
+		}
+		if got := atomic.LoadInt32(&calls); got != 1 {
+			t.Fatalf("MaxRetries=%d made %d attempts, want 1", n, got)
+		}
 	}
 }
 
@@ -285,12 +424,118 @@ func TestNewAppliesRetryDefaults(t *testing.T) {
 	if c.baseDelay != DefaultBaseDelay || c.maxDelay != DefaultMaxDelay {
 		t.Fatalf("backoff defaults not set: %v / %v", c.baseDelay, c.maxDelay)
 	}
-	// A zero-value Client built directly must still behave.
+	if c.HTTPClient.Timeout != defaultTimeout {
+		t.Fatalf("timeout = %v", c.HTTPClient.Timeout)
+	}
+	// A Client built directly opts in to retrying rather than acquiring it by
+	// surprise, but its backoff must still be usable if it does.
 	zero := &Client{}
-	if zero.retries() != DefaultMaxRetries {
-		t.Fatalf("zero-value retries = %d", zero.retries())
+	if zero.retries() != 0 {
+		t.Fatalf("zero-value retries = %d, want 0", zero.retries())
 	}
 	if d := zero.backoff(0, ""); d <= 0 {
 		t.Fatalf("zero-value backoff = %v", d)
+	}
+}
+
+// withTokenEndpoint points the OAuth exchange at srv for the duration of a test.
+func withTokenEndpoint(t *testing.T, srv *httptest.Server) {
+	t.Helper()
+	prevEndpoint, prevClient := tokenEndpoint, tokenHTTPClient
+	tokenEndpoint, tokenHTTPClient = srv.URL, srv.Client()
+	t.Cleanup(func() {
+		tokenEndpoint, tokenHTTPClient = prevEndpoint, prevClient
+	})
+}
+
+// The token exchange is the first request of every run. It used to be a bare
+// http.PostForm - no context, no timeout, no retry - so a single rate-limited
+// exchange failed the whole apply before a resource had been read.
+func TestFetchAccessTokenRetriesRateLimit(t *testing.T) {
+	var calls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseForm(); err != nil {
+			t.Errorf("form not parseable: %v", err)
+		}
+		if got := r.PostForm.Get("refresh_token"); got != "rt" {
+			t.Errorf("refresh token not replayed: %q", got)
+		}
+		if atomic.AddInt32(&calls, 1) < 3 {
+			w.Header().Set("Retry-After", "0")
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		_, _ = io.WriteString(w, `{"access_token":"at","expires_in":1209600}`)
+	}))
+	defer srv.Close()
+	withTokenEndpoint(t, srv)
+
+	tok, err := FetchAccessTokenContext(context.Background(), "id", "secret", "rt")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if tok != "at" {
+		t.Fatalf("token = %q", tok)
+	}
+	if got := atomic.LoadInt32(&calls); got != 3 {
+		t.Fatalf("expected 3 attempts, got %d", got)
+	}
+}
+
+func TestFetchAccessTokenRespectsContext(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Retry-After", "3600")
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+	withTokenEndpoint(t, srv)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	if _, err := FetchAccessTokenContext(ctx, "id", "secret", "rt"); err == nil {
+		t.Fatal("expected a context error")
+	}
+	if time.Since(start) > 5*time.Second {
+		t.Fatal("token backoff ignored context cancellation")
+	}
+}
+
+// An expired refresh token is a 400, not something to retry, and the guidance
+// on regenerating it has to survive.
+func TestFetchAccessTokenDoesNotRetryBadRequest(t *testing.T) {
+	var calls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = io.WriteString(w, `{"error":"invalid_grant"}`)
+	}))
+	defer srv.Close()
+	withTokenEndpoint(t, srv)
+
+	_, err := FetchAccessTokenContext(context.Background(), "id", "secret", "rt")
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Fatalf("invalid_grant retried %d times", got-1)
+	}
+	if !strings.Contains(err.Error(), "90 days") {
+		t.Fatalf("refresh-token guidance lost: %v", err)
+	}
+}
+
+// The deprecated wrapper must keep working for anything still calling it.
+func TestFetchAccessTokenWrapper(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `{"access_token":"at"}`)
+	}))
+	defer srv.Close()
+	withTokenEndpoint(t, srv)
+
+	tok, err := FetchAccessToken("id", "secret", "rt")
+	if err != nil || tok != "at" {
+		t.Fatalf("token = %q, err = %v", tok, err)
 	}
 }

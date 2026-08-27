@@ -137,7 +137,7 @@ func (p *WebexProvider) Configure(ctx context.Context, req provider.ConfigureReq
 
 		if hasAll {
 			var err error
-			token, err = client.FetchAccessToken(clientID, clientSecret, refreshToken)
+			token, err = client.FetchAccessTokenContext(ctx, clientID, clientSecret, refreshToken)
 			if err != nil {
 				resp.Diagnostics.AddError(
 					"Failed to Obtain Access Token",
