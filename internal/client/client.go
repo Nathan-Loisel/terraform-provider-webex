@@ -6,16 +6,34 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math/rand"
 	"net/http"
 	"net/url"
 	"strconv"
 	"time"
 )
 
+const (
+	// DefaultMaxRetries is the number of retries after the initial attempt.
+	DefaultMaxRetries = 5
+	DefaultBaseDelay  = time.Second
+	DefaultMaxDelay   = 30 * time.Second
+)
+
 type Client struct {
 	BaseURL    string
 	Token      string
 	HTTPClient *http.Client
+
+	// MaxRetries bounds the retries that follow a transient failure. Zero
+	// means DefaultMaxRetries.
+	MaxRetries int
+
+	// Backoff tuning, kept unexported because nothing outside this package
+	// has a reason to change it; the tests set it so the suite does not
+	// spend real seconds asleep.
+	baseDelay time.Duration
+	maxDelay  time.Duration
 }
 
 func New(token string, baseURL string) *Client {
@@ -26,8 +44,11 @@ func New(token string, baseURL string) *Client {
 		BaseURL: baseURL,
 		Token:   token,
 		HTTPClient: &http.Client{
-			Timeout: 10 * time.Second,
+			Timeout: 30 * time.Second,
 		},
+		MaxRetries: DefaultMaxRetries,
+		baseDelay:  DefaultBaseDelay,
+		maxDelay:   DefaultMaxDelay,
 	}
 }
 
@@ -46,6 +67,11 @@ func (e *APIError) Error() string {
 			"  - Service App refresh token: 90 days\n" +
 			"If using a static token, regenerate it from the Webex Developer Portal.\n" +
 			"If using OAuth (client_id + client_secret + refresh_token), your refresh token may have expired — regenerate it from your Service App's Org Authorizations page."
+	}
+	if e.StatusCode == http.StatusTooManyRequests {
+		msg += "\n\nThe request was rate limited and did not succeed after retrying.\n" +
+			"Webex applies its quota per organisation, so parallel changes compete for it.\n" +
+			"If this recurs, lower Terraform's concurrency, e.g. terraform apply -parallelism=2."
 	}
 	return msg
 }
@@ -99,142 +125,193 @@ func FetchAccessToken(clientID, clientSecret, refreshToken string) (string, erro
 }
 
 func (c *Client) do(ctx context.Context, method, path string, params url.Values, body interface{}, result interface{}) error {
-	u := c.BaseURL + "/" + path
-	if params != nil {
-		u += "?" + params.Encode()
-	}
-
-	var bodyReader io.Reader
+	var raw []byte
 	if body != nil {
 		b, err := json.Marshal(body)
 		if err != nil {
 			return fmt.Errorf("marshaling request body: %w", err)
 		}
-		bodyReader = bytes.NewReader(b)
+		raw = b
 	}
-
-	req, err := http.NewRequestWithContext(ctx, method, u, bodyReader)
-	if err != nil {
-		return fmt.Errorf("creating request: %w", err)
-	}
-	req.Header.Set("Authorization", "Bearer "+c.Token)
-	req.Header.Set("Content-Type", "application/json")
-
-	var resp *http.Response
-	for attempt := 0; attempt <= 3; attempt++ {
-		resp, err = c.HTTPClient.Do(req)
-		if err != nil {
-			if ctx.Err() != nil {
-				return ctx.Err()
-			}
-			if attempt < 1 {
-				select {
-				case <-ctx.Done():
-					return ctx.Err()
-				case <-time.After(time.Second):
-				}
-				if body != nil {
-					b, _ := json.Marshal(body)
-					bodyReader = bytes.NewReader(b)
-				}
-				req, _ = http.NewRequestWithContext(ctx, method, u, bodyReader)
-				req.Header.Set("Authorization", "Bearer "+c.Token)
-				req.Header.Set("Content-Type", "application/json")
-				continue
-			}
-			return fmt.Errorf("executing request: %w", err)
-		}
-		if resp.StatusCode != http.StatusTooManyRequests && resp.StatusCode != http.StatusBadGateway &&
-			resp.StatusCode != http.StatusServiceUnavailable && resp.StatusCode != http.StatusGatewayTimeout {
-			break
-		}
-		_ = resp.Body.Close()
-		delay := time.Duration(1<<uint(attempt)) * time.Second
-		if ra := resp.Header.Get("Retry-After"); ra != "" {
-			if seconds, parseErr := strconv.Atoi(ra); parseErr == nil && seconds > 0 {
-				delay = time.Duration(seconds) * time.Second
-			}
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(delay):
-		}
-		if body != nil {
-			b, _ := json.Marshal(body)
-			bodyReader = bytes.NewReader(b)
-		}
-		req, _ = http.NewRequestWithContext(ctx, method, u, bodyReader)
-		req.Header.Set("Authorization", "Bearer "+c.Token)
-		req.Header.Set("Content-Type", "application/json")
-	}
-
-	defer resp.Body.Close()
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return fmt.Errorf("reading response body: %w", err)
-	}
-
-	if resp.StatusCode >= 400 {
-		return &APIError{
-			StatusCode: resp.StatusCode,
-			Message:    string(respBody),
-			TrackingID: resp.Header.Get("TrackingID"),
-		}
-	}
-
-	if result != nil && len(respBody) > 0 {
-		if err := json.Unmarshal(respBody, result); err != nil {
-			return fmt.Errorf("unmarshaling response: %w", err)
-		}
-	}
-
-	return nil
+	return c.send(ctx, method, c.url(path, params), "application/json", raw, result)
 }
 
 func (c *Client) doPatch(ctx context.Context, path string, params url.Values, body interface{}, result interface{}) error {
+	raw, err := json.Marshal(body)
+	if err != nil {
+		return fmt.Errorf("marshaling request body: %w", err)
+	}
+	return c.send(ctx, http.MethodPatch, c.url(path, params), "application/json-patch+json", raw, result)
+}
+
+func (c *Client) url(path string, params url.Values) string {
 	u := c.BaseURL + "/" + path
 	if params != nil {
 		u += "?" + params.Encode()
 	}
+	return u
+}
 
-	b, err := json.Marshal(body)
-	if err != nil {
-		return fmt.Errorf("marshaling request body: %w", err)
+func (c *Client) newRequest(ctx context.Context, method, u, contentType string, body []byte) (*http.Request, error) {
+	// A fresh reader per attempt: a retry cannot replay a body that the
+	// previous attempt already consumed.
+	var r io.Reader
+	if body != nil {
+		r = bytes.NewReader(body)
 	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPatch, u, bytes.NewReader(b))
+	req, err := http.NewRequestWithContext(ctx, method, u, r)
 	if err != nil {
-		return fmt.Errorf("creating request: %w", err)
+		return nil, fmt.Errorf("creating request: %w", err)
 	}
 	req.Header.Set("Authorization", "Bearer "+c.Token)
-	req.Header.Set("Content-Type", "application/json-patch+json")
+	req.Header.Set("Content-Type", contentType)
+	return req, nil
+}
 
-	resp, err := c.HTTPClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("executing request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return fmt.Errorf("reading response body: %w", err)
-	}
-
-	if resp.StatusCode >= 400 {
-		return &APIError{
-			StatusCode: resp.StatusCode,
-			Message:    string(respBody),
-			TrackingID: resp.Header.Get("TrackingID"),
+// send issues a request and retries it while the failure looks transient.
+// Rate limiting is the common case rather than the exotic one: every resource
+// in an apply shares a single org-wide quota, so a handful of workspaces
+// changed in parallel will routinely trip a 429 that means "wait", not "stop".
+func (c *Client) send(ctx context.Context, method, u, contentType string, body []byte, result interface{}) error {
+	for attempt := 0; ; attempt++ {
+		req, err := c.newRequest(ctx, method, u, contentType, body)
+		if err != nil {
+			return err
 		}
+
+		resp, err := c.HTTPClient.Do(req)
+		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			if attempt >= c.retries() {
+				return fmt.Errorf("executing request: %w", err)
+			}
+			if err := sleep(ctx, c.backoff(attempt, "")); err != nil {
+				return err
+			}
+			continue
+		}
+
+		// Read and close before deciding to retry: an undrained body leaks the
+		// connection, and the body is also the only place the API says what
+		// actually went wrong, so it has to survive into the error.
+		respBody, readErr := io.ReadAll(resp.Body)
+		status := resp.StatusCode
+		retryAfter := resp.Header.Get("Retry-After")
+		trackingID := resp.Header.Get("TrackingID")
+		_ = resp.Body.Close()
+		if readErr != nil {
+			return fmt.Errorf("reading response body: %w", readErr)
+		}
+
+		if isRetryable(status) && attempt < c.retries() {
+			if err := sleep(ctx, c.backoff(attempt, retryAfter)); err != nil {
+				return err
+			}
+			continue
+		}
+
+		if status >= 400 {
+			return &APIError{
+				StatusCode: status,
+				Message:    string(respBody),
+				TrackingID: trackingID,
+			}
+		}
+
+		if result != nil && len(respBody) > 0 {
+			if err := json.Unmarshal(respBody, result); err != nil {
+				return fmt.Errorf("unmarshaling response: %w", err)
+			}
+		}
+		return nil
+	}
+}
+
+func isRetryable(status int) bool {
+	switch status {
+	case http.StatusTooManyRequests,
+		http.StatusBadGateway,
+		http.StatusServiceUnavailable,
+		http.StatusGatewayTimeout:
+		return true
+	}
+	return false
+}
+
+func (c *Client) retries() int {
+	if c.MaxRetries > 0 {
+		return c.MaxRetries
+	}
+	return DefaultMaxRetries
+}
+
+// backoff reports how long to wait before the next attempt. Retry-After wins
+// when the server sends it, since it knows when the window reopens; otherwise
+// the delay doubles. The jitter matters more than it looks: resources applied
+// in parallel are throttled at the same instant, so without it they would all
+// wake together and trip the same limit again.
+func (c *Client) backoff(attempt int, retryAfter string) time.Duration {
+	limit := c.maxDelay
+	if limit <= 0 {
+		limit = DefaultMaxDelay
+	}
+	if d, ok := parseRetryAfter(retryAfter, limit); ok {
+		return d
 	}
 
-	if result != nil && len(respBody) > 0 {
-		if err := json.Unmarshal(respBody, result); err != nil {
-			return fmt.Errorf("unmarshaling response: %w", err)
-		}
+	base := c.baseDelay
+	if base <= 0 {
+		base = DefaultBaseDelay
 	}
-	return nil
+	delay := base << uint(attempt)
+	if delay <= 0 || delay > limit {
+		delay = limit
+	}
+	return delay + time.Duration(rand.Int63n(int64(delay/2)+1))
+}
+
+// parseRetryAfter accepts both forms RFC 9110 allows: a count of seconds, or
+// an HTTP date.
+func parseRetryAfter(v string, limit time.Duration) (time.Duration, bool) {
+	if v == "" {
+		return 0, false
+	}
+	if seconds, err := strconv.Atoi(v); err == nil {
+		if seconds < 0 {
+			return 0, false
+		}
+		return capDelay(time.Duration(seconds)*time.Second, limit), true
+	}
+	if t, err := http.ParseTime(v); err == nil {
+		return capDelay(time.Until(t), limit), true
+	}
+	return 0, false
+}
+
+func capDelay(d, limit time.Duration) time.Duration {
+	if d < 0 {
+		return 0
+	}
+	if d > limit {
+		return limit
+	}
+	return d
+}
+
+func sleep(ctx context.Context, d time.Duration) error {
+	if d <= 0 {
+		return nil
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
+	}
 }
 
 func IsNotFound(err error) bool {
